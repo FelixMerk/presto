@@ -548,7 +548,7 @@ public class QueryMonitor
                 snapshot.getMin(),
                 snapshot.getMax(),
                 (long) snapshot.getTotal(),
-                snapshot.getTotal() / snapshot.getCount());
+                snapshot.getAvg());
     }
 
     public static class JsonPlanFragment

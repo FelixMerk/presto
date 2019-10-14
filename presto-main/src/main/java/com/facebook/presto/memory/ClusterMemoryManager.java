@@ -13,9 +13,8 @@
  */
 package com.facebook.presto.memory;
 
-import com.facebook.presto.execution.LocationFactory;
-import com.facebook.presto.execution.QueryExecution;
-import com.facebook.presto.execution.QueryIdGenerator;
+import com.facebook.presto.util.StringTableUtils;
+import com.facebook.presto.execution.*;
 import com.facebook.presto.execution.scheduler.NodeSchedulerConfig;
 import com.facebook.presto.memory.LowMemoryKiller.QueryMemoryInfo;
 import com.facebook.presto.metadata.InternalNode;
@@ -40,6 +39,8 @@ import com.google.common.io.Closer;
 import io.airlift.http.client.HttpClient;
 import io.airlift.json.JsonCodec;
 import io.airlift.log.Logger;
+import io.airlift.stats.Distribution;
+import io.airlift.stats.Distribution.DistributionSnapshot;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 import org.weakref.jmx.JmxException;
@@ -51,14 +52,9 @@ import javax.annotation.concurrent.GuardedBy;
 import javax.inject.Inject;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
+import java.rmi.Remote;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
@@ -310,8 +306,11 @@ public class ClusterMemoryManager
         updateNodes(assignmentsRequest);
     }
 
+
     private synchronized void callOomKiller(Iterable<QueryExecution> runningQueries)
     {
+        logOomState(runningQueries);
+
         List<QueryMemoryInfo> queryMemoryInfoList = Streams.stream(runningQueries)
                 .map(this::createQueryMemoryInfo)
                 .collect(toImmutableList());
@@ -320,9 +319,11 @@ public class ClusterMemoryManager
                 .filter(Optional::isPresent)
                 .map(Optional::get)
                 .collect(toImmutableList());
+
         Optional<QueryId> chosenQueryId = lowMemoryKiller.chooseQueryToKill(queryMemoryInfoList, nodeMemoryInfos);
         if (chosenQueryId.isPresent()) {
             log.debug("Low memory killer chose %s", chosenQueryId.get());
+
             Optional<QueryExecution> chosenQuery = Streams.stream(runningQueries).filter(query -> chosenQueryId.get().equals(query.getQueryId())).collect(toOptional());
             if (chosenQuery.isPresent()) {
                 // See comments in  isLastKilledQueryGone for why chosenQuery might be absent.
@@ -330,8 +331,82 @@ public class ClusterMemoryManager
                 queriesKilledDueToOutOfMemory.incrementAndGet();
                 lastKilledQuery = chosenQueryId.get();
                 logQueryKill(chosenQueryId.get(), nodeMemoryInfos);
+
+
             }
         }
+    }
+
+    private void logOomState(Iterable<QueryExecution> runningQueries)
+    {
+        log.debug("OomState logging commences");
+
+        // Query Info
+        List<QueryInfo> queryInfos = runningQueries.stream()
+                .map(queryExecution -> queryExecution.getQueryInfo())
+                .collect(toImmutableList());
+
+        Map<String, QueryStats> mappedQueryStats = new HashMap<>();
+        queryInfos.forEach(queryInfo -> mappedQueryStats.put(queryInfo.getQueryId().toString(), queryInfo.getQueryStats()));
+
+        List<Map.Entry<String, QueryStats>> sortedQueryStats = mappedQueryStats.entrySet().stream()
+                .sorted(Map.Entry.comparingByValue( (q1, q2) -> q1.getPeakTaskTotalMemory().compareTo(q2.getPeakTaskTotalMemory()) ))
+                .collect(toImmutableList());
+
+        // Sum of memory used across the cluster across queries
+        double totalMemoryUsage = sortedQueryStats.stream().mapToDouble(entry -> entry.getValue().getTotalMemoryReservation().getValue()).sum();
+        log.debug(String.format("Total memory reservation across the cluster across queries: %f", totalMemoryUsage));
+
+        // Log sortedQueryStats
+        List<List<String>> rawTable = new List<>;
+        for (Map.Entry<String, QueryStats> kv:sortedQueryStats) {
+            QueryStats queryStats = kv.getValue();
+
+            List<String> queryInfo = Arrays.asList(
+                    kv.getKey(),
+                    queryStats.getUserMemoryReservation().toString(),
+                    queryStats.getTotalMemoryReservation().toString(),
+                    queryStats.getPeakUserMemoryReservation().toString(),
+                    queryStats.getPeakTotalMemoryReservation().toString(),
+                    queryStats.getPeakTaskTotalMemory().toString(),
+                    queryStats.getPeakTaskUserMemory().toString()
+            );
+            rawTable.add(queryInfo);
+        }
+        List<String> rowsToLog = StringTableUtils.getTableStrings(rawTable);
+
+        log.debug("Key UserMemoryReservation TotalMemoryReservation PeakUserMemoryReservation PeakTotalMemoryReservation PeakTaskTotalMemory PeakTaskUserMemory");
+        for (String row:rowsToLog) {
+            log.debug(row);
+        }
+
+        // Node info: Log Distributions
+
+        Map<String, MemoryInfo> mappedMemoryInfo = new HashMap<>();
+        Distribution nodeMemoryDistribution = new Distribution();
+        for (Map.Entry<String, RemoteNodeMemory> node : nodes.entrySet()) {
+            if (node.getValue().getInfo().isPresent()) {
+                MemoryInfo memoryInfo = node.getValue().getInfo().get();
+                mappedMemoryInfo.put(node.getKey(), memoryInfo);
+                nodeMemoryDistribution.add( (long) memoryInfo.getTotalNodeMemory().getValue());
+            }
+        }
+
+        log.debug("Total Node Memory snapshot:" + nodeMemoryDistribution.snapshot().toString());
+
+        List<Long> allPoolReservedBytes = new ArrayList<>();
+        Distribution poolBytesDistribution = new Distribution();
+        for (MemoryInfo memoryInfo:mappedMemoryInfo.values()) {
+            Map<MemoryPoolId, MemoryPoolInfo> pools = memoryInfo.getPools();
+            for (MemoryPoolInfo poolInfo:pools.values()) {
+                allPoolReservedBytes.add(poolInfo.getReservedBytes());
+                poolBytesDistribution.add(poolInfo.getReservedBytes())
+            }
+        }
+
+        log.debug("Pool Reserved Bytes snapshot:" + poolBytesDistribution.snapshot().toString());
+
+
     }
 
     @GuardedBy("this")
